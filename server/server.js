@@ -5,134 +5,285 @@ const http = require('http');
 const socketIo = require('socket.io');
 const jwt = require('jsonwebtoken');
 const dotenv = require('dotenv');
-const Room = require('./models/Room'); // Assuming Room model is defined in ./models/Room.js
-
+const helmet = require('helmet');
+const morgan = require('morgan');
+const rateLimit = require('express-rate-limit');
+const compression = require('compression');
 dotenv.config();
 
+// Initialize express app
 const app = express();
-
 const server = http.createServer(app);
 
 // Load environment-specific configuration
 const config = require(`./config/${process.env.NODE_ENV || 'development'}.js`);
 
+// Initialize Socket.IO with enhanced configuration
 const io = socketIo(server, {
-  cors: config.cors
+  cors: {
+    origin: ['http://localhost:3000', 'http://localhost:3001'],
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    credentials: true,
+    allowedHeaders: ['Content-Type', 'Authorization']
+  },
+  allowEIO3: true,
+  pingTimeout: parseInt(process.env.SOCKET_PING_TIMEOUT) || 60000,
+  pingInterval: parseInt(process.env.SOCKET_PING_INTERVAL) || 25000,
+  upgradeTimeout: 30000,
+  maxHttpBufferSize: 1e8,
+  transports: ['websocket', 'polling'],
+  allowUpgrades: true
 });
 
-// Middleware
-app.use(cors(config.cors));
-app.use(express.json());
+// Security middleware
+app.use(helmet({
+  contentSecurityPolicy: false,
+  crossOriginEmbedderPolicy: false
+}));
+
+// Logging
+morgan.token('user', (req) => req.user?.username || 'anonymous');
+morgan.token('body', (req) => JSON.stringify(req.body));
+app.use(morgan(':method :url :status :response-time ms - :user :body'));
+
+// CORS
+app.use(cors({
+  origin: ['http://localhost:3000', 'http://localhost:3001'],
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  credentials: true,
+  allowedHeaders: ['Content-Type', 'Authorization', 'If-None-Match', 'If-Modified-Since'],
+  exposedHeaders: ['ETag', 'Last-Modified']
+}));
+
+// Rate limiting
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // limit each IP to 100 requests per windowMs
+  message: 'Too many requests from this IP, please try again later'
+});
+app.use('/api/', limiter);
+
+// Compression
+app.use(compression({
+  filter: (req, res) => {
+    if (req.headers['x-no-compression']) {
+      return false;
+    }
+    return compression.filter(req, res);
+  },
+  level: 6 // Default compression level
+}));
+
+// Body parsing
+app.use(express.json({
+  limit: '1mb',
+  verify: (req, res, buf) => {
+    req.rawBody = buf;
+  }
+}));
+
+// Cache control middleware
+app.use((req, res, next) => {
+  // Cache static assets
+  if (req.method === 'GET' && req.path.startsWith('/static/')) {
+    res.set('Cache-Control', 'public, max-age=31536000'); // 1 year
+    return next();
+  }
+
+  // Cache API responses
+  if (req.method === 'GET' && req.path.startsWith('/api/')) {
+    res.set('Cache-Control', 'private, must-revalidate');
+  } else {
+    // Prevent caching for non-GET requests
+    res.set('Cache-Control', 'no-store');
+  }
+  next();
+});
+
+// Request logging middleware
+app.use((req, res, next) => {
+  console.log(`${new Date().toISOString()} - ${req.method} ${req.baseUrl}${req.path}`);
+  next();
+});
 
 // MongoDB Connection with better error handling
-mongoose.connect(process.env.MONGO_URI, {
-  useNewUrlParser: true,
-  useUnifiedTopology: true,
-  serverSelectionTimeoutMS: 5000,
-  socketTimeoutMS: 45000,
-})
-.then(() => {
-  console.log('Connected to MongoDB');
-})
-.catch(err => {
-  console.error('MongoDB connection error:', err);
+let dbConnection;
+const connectDB = async () => {
+  try {
+    if (dbConnection) {
+      console.log('Using existing MongoDB connection');
+      return dbConnection;
+    }
+
+    console.log('Connecting to MongoDB...');
+    dbConnection = await mongoose.connect(process.env.MONGO_URI, {
+      useNewUrlParser: true,
+      useUnifiedTopology: true,
+      serverSelectionTimeoutMS: 5000,
+      socketTimeoutMS: 45000,
+    });
+
+    console.log('Connected to MongoDB');
+
+    // Initialize models and indexes after connection
+    const User = require('./models/User');
+    const Room = require('./models/Room');
+    const Message = require('./src/models/Message');
+
+    // Initialize indexes sequentially
+    try {
+      await User.init();
+      console.log('User model initialized');
+      
+      await Room.init();
+      console.log('Room model initialized');
+      
+      await Message.init();
+      console.log('Message model initialized');
+
+      console.log('All models initialized successfully');
+    } catch (error) {
+      console.error('Error initializing models:', error);
+      throw error;
+    }
+
+    return dbConnection;
+  } catch (error) {
+    console.error('MongoDB connection error:', error);
+    throw error;
+  }
+};
+
+// Connect to MongoDB before starting server
+connectDB().then(() => {
+  // Routes
+  const authRoutes = require('./routes/auth');
+  const roomRoutes = require('./routes/rooms');
+  const userRoutes = require('./routes/users');
+  const messageRoutes = require('./src/routes/messages');
+
+  // Register routes
+  app.use('/api/auth', authRoutes);
+  app.use('/api/rooms', roomRoutes);
+  app.use('/api/users', userRoutes);
+  app.use('/api/messages', messageRoutes);
+
+  // Health check endpoint
+  app.get('/', (req, res) => {
+    res.json({ 
+      status: "API Working",
+      timestamp: new Date(),
+      env: process.env.NODE_ENV || 'development',
+      socketTransports: io.engine?.transports || ['websocket', 'polling']
+    });
+  });
+
+  // CORS preflight
+  app.options('*', cors());
+
+  // 404 handler
+  app.use((req, res) => {
+    console.log('404 - Route not found:', req.url);
+    res.status(404).json({ 
+      message: 'Route not found',
+      path: req.url
+    });
+  });
+
+  // Error handling middleware
+  app.use((err, req, res, next) => {
+    console.error('Error occurred:', {
+      message: err.message,
+      stack: err.stack,
+      path: req.url,
+      method: req.method
+    });
+    
+    res.status(err.status || 500).json({
+      message: err.message || 'Something went wrong!',
+      error: process.env.NODE_ENV === 'development' ? {
+        message: err.message,
+        stack: err.stack
+      } : undefined
+    });
+  });
+
+  // Initialize socket.io with our enhanced implementation
+  require('./src/socket')(io);
+
+  const PORT = process.env.PORT || 5001;
+
+  // Start server with error handling
+  server.listen(PORT, () => {
+    console.log('=================================');
+    console.log(`Server running on port ${PORT}`);
+    console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
+    console.log(`MongoDB: ${process.env.MONGO_URI.split('@')[1]}`);
+    console.log(`Socket.IO transports: ${io.engine?.transports?.join(', ') || 'websocket, polling'}`);
+    console.log('=================================');
+  }).on('error', (err) => {
+    console.error('Failed to start server:', err);
+    process.exit(1);
+  });
+}).catch(error => {
+  console.error('Failed to initialize server:', error);
   process.exit(1);
 });
 
-// Routes
-const authRoutes = require('./routes/auth');
-const roomRoutes = require('./routes/rooms');
-const userRoutes = require('./routes/users');
-app.use('/api/auth', authRoutes);
-app.use('/api/rooms', roomRoutes);
-app.use('/api/users', userRoutes);
-
-app.get('/', (req, res) => {
-   res.send("API Working");
-
-})
-
-// Socket.IO middleware for authentication
-io.use((socket, next) => {
-  const token = socket.handshake.auth.token;
+// Handle server shutdown gracefully
+const shutdown = async () => {
+  console.log('\nShutdown signal received...');
   
-  if (!token) {
-    return next(new Error('Authentication error'));
-  }
-
   try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    socket.userId = decoded.userId;
-    next();
-  } catch (err) {
-    next(new Error('Authentication error'));
-  }
-});
-
-// Socket.IO Connection
-io.on('connection', (socket) => {
-  console.log('New client connected:', socket.userId);
-
-  // Join the global room by default
-  socket.join('global');
-
-  // Handle joining private rooms
-  socket.on('joinRoom', async (roomId) => {
-    try {
-      console.log('Attempting to join room:', roomId);
-      const room = await Room.findById(roomId)
-        .populate('participants', 'username');
-
-      if (room && room.participants.some(p => p._id.toString() === socket.userId)) {
-        socket.join(roomId);
-        socket.emit('roomJoined', roomId);
-        console.log('User joined room:', roomId);
-        
-        // Notify other participants
-        socket.to(roomId).emit('userJoined', {
-          roomId,
-          username: room.participants.find(p => p._id.toString() === socket.userId).username
+    // Close socket connections first
+    if (io) {
+      await new Promise((resolve) => {
+        io.close(() => {
+          console.log('Socket.IO server closed');
+          resolve();
         });
-      } else {
-        console.log('Room not found or user not authorized:', roomId);
-      }
-    } catch (error) {
-      console.error('Error joining room:', error);
-    }
-  });
-
-  // Handle leaving rooms
-  socket.on('leaveRoom', async (roomId) => {
-    try {
-      socket.leave(roomId);
-      socket.emit('roomLeft', roomId);
-      console.log('User left room:', roomId);
-    } catch (error) {
-      console.error('Error leaving room:', error);
-    }
-  });
-
-  socket.on('sendMessage', async (data) => {
-    try {
-      console.log('Message received for room:', data.room);
-      // Broadcast the message to the specific room
-      io.to(data.room).emit('message', {
-        content: data.content,
-        sender: data.sender,
-        roomId: data.room,
-        timestamp: new Date()
       });
-    } catch (error) {
-      console.error('Error sending message:', error);
     }
-  });
 
-  socket.on('disconnect', () => {
-    console.log('Client disconnected:', socket.userId);
-  });
+    // Then close HTTP server
+    if (server) {
+      await new Promise((resolve) => {
+        server.close(() => {
+          console.log('HTTP server closed');
+          resolve();
+        });
+      });
+    }
+
+    // Finally close MongoDB connection
+    if (mongoose.connection.readyState === 1) {
+      await mongoose.connection.close();
+      console.log('MongoDB connection closed');
+    }
+    
+    process.exit(0);
+  } catch (error) {
+    console.error('Error during shutdown:', error);
+    process.exit(1);
+  }
+};
+
+// Handle various shutdown signals
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
+
+// Handle uncaught exceptions
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught Exception:', err);
+  shutdown();
 });
 
-const PORT = process.env.PORT || 5001;
-server.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+// Handle unhandled promise rejections
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+});
+
+// Cleanup on exit
+process.on('exit', (code) => {
+  console.log(`Process exiting with code: ${code}`);
 });

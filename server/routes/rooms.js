@@ -2,43 +2,42 @@ const express = require('express');
 const router = express.Router();
 const Room = require('../models/Room');
 const User = require('../models/User');
-const jwt = require('jsonwebtoken');
-
-// Middleware to verify token
-const auth = async (req, res, next) => {
-  try {
-    const token = req.header('Authorization').replace('Bearer ', '');
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    req.userId = decoded.userId;
-    next();
-  } catch (error) {
-    console.error('Auth middleware error:', error);
-    res.status(401).json({ message: 'Please authenticate' });
-  }
-};
+const auth = require('../middleware/auth');
 
 // Create a new room
 router.post('/', auth, async (req, res) => {
   try {
     console.log('Creating room with data:', req.body);
-    const { name, participants = [] } = req.body;
+    const { name, participants = [], isPrivate = true } = req.body;
 
-    if (!name || name.trim().length === 0) {
-      return res.status(400).json({ message: 'Room name is required' });
+    if (!name || name.trim().length < 2 || name.trim().length > 50) {
+      return res.status(400).json({ 
+        message: 'Room name must be between 2 and 50 characters' 
+      });
     }
 
-    // Check if room name already exists
-    const existingRoom = await Room.findOne({ name: name.trim() });
+    // Check if room name already exists (case-insensitive)
+    const existingRoom = await Room.findOne({ 
+      name: { $regex: new RegExp(`^${name.trim()}$`, 'i') }
+    });
     if (existingRoom) {
       return res.status(400).json({ message: 'Room name already exists' });
     }
 
-    // Create new room with creator as initial participant
+    // Validate participants exist
+    if (participants.length > 0) {
+      const validUsers = await User.find({ _id: { $in: participants } });
+      if (validUsers.length !== participants.length) {
+        return res.status(400).json({ message: 'One or more invalid participants' });
+      }
+    }
+
+    // Create new room (creator is automatically added as participant)
     const room = new Room({
       name: name.trim(),
       creator: req.userId,
-      participants: [req.userId, ...participants.filter(id => id !== req.userId)],
-      isPrivate: true
+      participants: participants.filter(id => id !== req.userId),
+      isPrivate
     });
 
     await room.save();
@@ -54,8 +53,7 @@ router.post('/', auth, async (req, res) => {
     console.error('Server error creating room:', error);
     res.status(500).json({ 
       message: 'Error creating room', 
-      error: error.message,
-      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
     });
   }
 });
@@ -64,11 +62,14 @@ router.post('/', auth, async (req, res) => {
 router.get('/', auth, async (req, res) => {
   try {
     const rooms = await Room.find({
-      participants: req.userId
+      $or: [
+        { participants: req.userId },
+        { isPrivate: false }
+      ]
     })
     .populate('participants', 'username email')
     .populate('creator', 'username email')
-    .sort({ createdAt: -1 });
+    .sort({ lastActivity: -1 });
 
     res.json(rooms);
   } catch (error) {
@@ -80,15 +81,16 @@ router.get('/', auth, async (req, res) => {
 // Get specific room
 router.get('/:id', auth, async (req, res) => {
   try {
-    const room = await Room.findOne({
-      _id: req.params.id,
-      participants: req.userId
-    })
-    .populate('participants', 'username email')
-    .populate('creator', 'username email');
+    const room = await Room.findById(req.params.id)
+      .populate('participants', 'username email')
+      .populate('creator', 'username email');
 
     if (!room) {
       return res.status(404).json({ message: 'Room not found' });
+    }
+
+    if (!room.hasAccess(req.userId)) {
+      return res.status(403).json({ message: 'Access denied to room' });
     }
 
     res.json(room);
@@ -102,6 +104,11 @@ router.get('/:id', auth, async (req, res) => {
 router.post('/:id/participants', auth, async (req, res) => {
   try {
     const { participants } = req.body;
+    
+    if (!Array.isArray(participants) || participants.length === 0) {
+      return res.status(400).json({ message: 'No participants provided' });
+    }
+
     const room = await Room.findOne({
       _id: req.params.id,
       creator: req.userId
@@ -111,13 +118,14 @@ router.post('/:id/participants', auth, async (req, res) => {
       return res.status(404).json({ message: 'Room not found or unauthorized' });
     }
 
-    // Add new participants
-    const newParticipants = participants.filter(
-      id => !room.participants.includes(id)
-    );
-    room.participants.push(...newParticipants);
+    // Validate participants exist
+    const validUsers = await User.find({ _id: { $in: participants } });
+    if (validUsers.length !== participants.length) {
+      return res.status(400).json({ message: 'One or more invalid participants' });
+    }
 
-    await room.save();
+    // Add new participants using the model method
+    await room.addParticipants(participants);
 
     const updatedRoom = await Room.findById(room._id)
       .populate('participants', 'username email')
@@ -126,7 +134,39 @@ router.post('/:id/participants', auth, async (req, res) => {
     res.json(updatedRoom);
   } catch (error) {
     console.error('Error adding participants:', error);
-    res.status(500).json({ message: 'Error adding participants' });
+    res.status(500).json({ 
+      message: 'Error adding participants',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+// Remove participant from room
+router.delete('/:id/participants/:userId', auth, async (req, res) => {
+  try {
+    const room = await Room.findOne({
+      _id: req.params.id,
+      creator: req.userId
+    });
+
+    if (!room) {
+      return res.status(404).json({ message: 'Room not found or unauthorized' });
+    }
+
+    // Remove participant using the model method
+    await room.removeParticipant(req.params.userId);
+
+    const updatedRoom = await Room.findById(room._id)
+      .populate('participants', 'username email')
+      .populate('creator', 'username email');
+
+    res.json(updatedRoom);
+  } catch (error) {
+    console.error('Error removing participant:', error);
+    res.status(500).json({ 
+      message: 'Error removing participant',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
   }
 });
 
@@ -139,16 +179,18 @@ router.delete('/:id/leave', auth, async (req, res) => {
       return res.status(404).json({ message: 'Room not found' });
     }
 
+    if (!room.hasAccess(req.userId)) {
+      return res.status(403).json({ message: 'Not a member of this room' });
+    }
+
     // If user is creator and there are other participants, assign new creator
-    if (room.creator.toString() === req.userId && room.participants.length > 1) {
-      const newCreator = room.participants.find(p => p.toString() !== req.userId);
+    if (room.creator.equals(req.userId) && room.participants.length > 1) {
+      const newCreator = room.participants.find(p => !p.equals(req.userId));
       room.creator = newCreator;
     }
     
     // Remove user from participants
-    room.participants = room.participants.filter(
-      p => p.toString() !== req.userId
-    );
+    room.participants = room.participants.filter(p => !p.equals(req.userId));
 
     // If no participants left, delete the room
     if (room.participants.length === 0) {
@@ -160,7 +202,10 @@ router.delete('/:id/leave', auth, async (req, res) => {
     res.json({ message: 'Left room successfully' });
   } catch (error) {
     console.error('Error leaving room:', error);
-    res.status(500).json({ message: 'Error leaving room' });
+    res.status(500).json({ 
+      message: 'Error leaving room',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
   }
 });
 

@@ -1,0 +1,52 @@
+{
+  "verbose": true,
+  "ignore": [
+    ".git",
+    "node_modules/**/node_modules",
+    "client",
+    "*.test.js",
+    "logs"
+  ],
+  "watch": [
+    "server.js",
+    "start.js",
+    "src/**/*.js",
+    "routes/**/*.js",
+    "models/**/*.js",
+    "middleware/**/*.js",
+    "config/**/*.js",
+    "scripts/**/*.js"
+  ],
+  "ext": "js,json,env",
+  "exec": "node -r dotenv/config start.js",
+  "events": {
+    "start": "cls || clear",
+    "restart": "node scripts/check-env.js && cls || clear"
+  },
+  "env": {
+    "NODE_ENV": "development",
+    "LOG_LEVEL": "debug"
+  },
+  "delay": 1000,
+  "signal": "SIGTERM",
+  "legacyWatch": false,
+  "restartable": "rs",
+  "colours": true,
+  "execMap": {
+    "js": "node --trace-warnings"
+  },
+  "restartSignal": "SIGUSR2",
+  "stdout": true,
+  "stderr": true,
+  "runOnChangeOnly": false,
+  "exitcrash": true,
+  "ignoreRoot": [".git"],
+  "watch_interval": 1000,
+  "on_restart": [
+    "echo 'App restarted due to changes'"
+  ],
+  "on_exit": [
+    "echo 'App exited cleanly'",
+    "node scripts/cleanup.js"
+  ]
+}

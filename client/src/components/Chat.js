@@ -1,82 +1,179 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import {
   Box,
-  Button,
-  TextField,
   Typography,
-  Paper,
-  List,
-  ListItem,
-  ListItemText,
-  IconButton,
-  Dialog,
-  DialogTitle,
-  DialogContent,
-  DialogActions,
-  Divider,
-  Menu,
-  MenuItem,
   AppBar,
   Toolbar,
+  IconButton,
+  Drawer,
   Container,
-  Drawer
+  Paper,
+  Snackbar,
+  Alert,
+  CircularProgress,
+  Backdrop
 } from '@mui/material';
-import { 
-  Add as AddIcon, 
+import {
   Menu as MenuIcon,
-  PersonAdd as PersonAddIcon,
-  MoreVert as MoreVertIcon,
-  Logout as LogoutIcon
+  Logout as LogoutIcon,
+  WifiOff as WifiOffIcon
 } from '@mui/icons-material';
-import { io } from 'socket.io-client';
-import { encryptMessage, decryptMessage } from '../utils/encryption';
 import { useNavigate } from 'react-router-dom';
+import { io } from 'socket.io-client';
 import axios from 'axios';
 import config from '../config';
+import { encryptMessage, decryptMessage } from '../utils/encryption';
+
+// Import components
+import RoomList from './RoomList';
+import CreateRoomDialog from './CreateRoomDialog';
+import ManageRoomDialog from './ManageRoomDialog';
+import MessageList from './MessageList';
+import MessageInput from './MessageInput';
 
 const Chat = () => {
-  const [messages, setMessages] = useState({});
-  const [message, setMessage] = useState('');
+  // State
   const [socket, setSocket] = useState(null);
+  const [messages, setMessages] = useState({});
   const [rooms, setRooms] = useState([]);
   const [currentRoom, setCurrentRoom] = useState('global');
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [createRoomOpen, setCreateRoomOpen] = useState(false);
-  const [newRoomName, setNewRoomName] = useState('');
-  const [addParticipantOpen, setAddParticipantOpen] = useState(false);
-  const [searchUser, setSearchUser] = useState('');
-  const [searchResults, setSearchResults] = useState([]);
+  const [manageRoomOpen, setManageRoomOpen] = useState(false);
   const [selectedRoom, setSelectedRoom] = useState(null);
-  const [isLoadingHistory, setIsLoadingHistory] = useState(false);
+  const [isLoadingMessages, setIsLoadingMessages] = useState(false);
+  const [isSendingMessage, setIsSendingMessage] = useState(false);
+  const [error, setError] = useState('');
+  const [isConnecting, setIsConnecting] = useState(true);
+  const [isReconnecting, setIsReconnecting] = useState(false);
+  const [connectionAttempts, setConnectionAttempts] = useState(0);
+
   const currentUserId = localStorage.getItem('userId');
-  const messagesEndRef = useRef(null);
+  const currentUsername = localStorage.getItem('username');
   const navigate = useNavigate();
 
-  // Fetch rooms on component mount
+  // Message handlers
+  const handleIncomingMessage = useCallback(async (data) => {
+    try {
+      console.log('Received message:', data);
+      const decryptedContent = data.type === 'system' ? 
+        data.content : 
+        await decryptMessage(data.content, config.SHARED_KEY);
+
+      setMessages(prev => {
+        const roomMessages = prev[data.roomId] || [];
+        if (roomMessages.some(msg => msg._id === data._id)) {
+          return prev;
+        }
+
+        return {
+          ...prev,
+          [data.roomId]: [
+            ...roomMessages,
+            {
+              ...data,
+              content: decryptedContent,
+              metadata: {
+                ...data.metadata,
+                encrypted: data.type !== 'system'
+              }
+            }
+          ].sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp))
+        };
+      });
+    } catch (error) {
+      console.error('Error handling message:', error);
+      setError('Error processing message');
+    }
+  }, []);
+
+  // Fetch message history
+  const fetchMessageHistory = useCallback(async (roomId) => {
+    setIsLoadingMessages(true);
+    try {
+      const token = localStorage.getItem('token');
+      const response = await axios.get(
+        config.getApiUrl(`messages/${roomId}`),
+        config.getRequestConfig(token)
+      );
+
+      // Handle the new response format which includes messages and metadata
+      const { messages: responseMessages = [], metadata = {} } = response.data || {};
+
+      if (!Array.isArray(responseMessages)) {
+        console.error('Invalid messages format:', response.data);
+        throw new Error('Invalid response format');
+      }
+
+      const decryptedMessages = await Promise.all(
+        responseMessages.map(async msg => ({
+          ...msg,
+          content: msg.type === 'system' ? 
+            msg.content : 
+            await decryptMessage(msg.content, config.SHARED_KEY),
+          metadata: {
+            ...msg.metadata,
+            encrypted: msg.type !== 'system'
+          }
+        }))
+      );
+
+      setMessages(prev => ({
+        ...prev,
+        [roomId]: decryptedMessages
+      }));
+
+      // Update room info if available
+      if (metadata?.room) {
+        setRooms(prev => 
+          prev.map(room => 
+            room.id === metadata.room.id ? 
+              { ...room, ...metadata.room } : 
+              room
+          )
+        );
+      }
+    } catch (error) {
+      console.error('Error fetching messages:', error);
+      if (error.response?.status === 403) {
+        setCurrentRoom('global');
+        socket?.emit('joinGlobalChat');
+      }
+      setError('Error loading messages');
+    } finally {
+      setIsLoadingMessages(false);
+    }
+  }, [socket]);
+
+  // Fetch rooms on mount
   useEffect(() => {
     const fetchRooms = async () => {
       try {
         const token = localStorage.getItem('token');
-        const response = await axios.get(`${config.SERVER_URL}/api/rooms`, {
-          headers: { Authorization: `Bearer ${token}` }
-        });
+        if (!token) {
+          navigate('/login');
+          return;
+        }
+
+        const response = await axios.get(
+          config.getApiUrl('rooms'),
+          config.getRequestConfig(token)
+        );
         setRooms(response.data);
       } catch (error) {
         console.error('Error fetching rooms:', error);
+        if (error.response?.status === 401) {
+          navigate('/login');
+        } else {
+          setError('Error loading rooms');
+        }
       }
     };
 
     fetchRooms();
-  }, []);
+  }, [navigate]);
 
-  // Add useEffect for initial message loading
-  useEffect(() => {
-    if (socket && currentRoom) {
-      console.log('Loading initial messages for room:', currentRoom);
-      fetchMessageHistory(currentRoom);
-    }
-  }, [socket, currentRoom]);
-
+  // Socket connection
   useEffect(() => {
     const token = localStorage.getItem('token');
     if (!token) {
@@ -84,491 +181,317 @@ const Chat = () => {
       return;
     }
 
-    // Create socket connection if it doesn't exist
     if (!socket) {
       const newSocket = io(config.SOCKET_URL, {
-        auth: {
-          token
-        }
+        auth: { token },
+        ...config.SOCKET_OPTIONS
       });
 
-      setSocket(newSocket);
-
-      // Set up event listeners
-      newSocket.on('message', (data) => {
-        try {
-          const sharedKey = 'shared-secret-key';
-          let decryptedContent;
-          try {
-            decryptedContent = decryptMessage(data.content, sharedKey);
-          } catch (error) {
-            console.warn('Failed to decrypt message, using raw content:', error);
-            decryptedContent = data.content;
-          }
-          
-          console.log('Received message:', { ...data, content: decryptedContent });
-          
-          setMessages(prev => ({
-            ...prev,
-            [data.roomId]: [
-              ...(prev[data.roomId] || []),
-              {
-                ...data,
-                content: decryptedContent
-              }
-            ]
-          }));
-        } catch (error) {
-          console.error('Error handling message:', error);
-        }
-      });
-
-      newSocket.on('roomJoined', (roomId) => {
-        console.log(`Joined room: ${roomId}`);
-      });
-
-      newSocket.on('userJoined', (data) => {
-        console.log(`${data.username} joined room: ${data.roomId}`);
+      newSocket.on('connect', () => {
+        console.log('Socket connected');
+        setIsConnecting(false);
+        setIsReconnecting(false);
+        setConnectionAttempts(0);
+        newSocket.emit('joinGlobalChat');
       });
 
       newSocket.on('connect_error', (error) => {
         console.error('Socket connection error:', error);
+        setConnectionAttempts(prev => prev + 1);
+        setIsReconnecting(true);
         if (error.message === 'Authentication error') {
           navigate('/login');
+        } else {
+          setError('Connection error');
         }
       });
 
-      // Join global chat by default
-      newSocket.emit('joinGlobalChat');
+      newSocket.on('disconnect', (reason) => {
+        console.log('Socket disconnected:', reason);
+        setIsReconnecting(true);
+      });
 
-      // Clean up function
+      newSocket.on('message', handleIncomingMessage);
+      newSocket.on('error', (error) => {
+        console.error('Socket error:', error);
+        setError(error.message);
+      });
+      newSocket.on('userJoined', (data) => {
+        handleIncomingMessage({
+          id: Date.now().toString(),
+          content: `${data.username} joined the room`,
+          timestamp: new Date().toISOString(),
+          type: 'system',
+          roomId: data.roomId
+        });
+      });
+      newSocket.on('userLeft', (data) => {
+        handleIncomingMessage({
+          id: Date.now().toString(),
+          content: `${data.username} left the room`,
+          timestamp: new Date().toISOString(),
+          type: 'system',
+          roomId: data.roomId
+        });
+      });
+
+      setSocket(newSocket);
+
       return () => {
-        if (newSocket) {
-          newSocket.off('message');
-          newSocket.off('roomJoined');
-          newSocket.off('userJoined');
-          newSocket.off('connect_error');
-          newSocket.close();
-        }
+        newSocket.off('message');
+        newSocket.off('error');
+        newSocket.off('connect_error');
+        newSocket.off('userJoined');
+        newSocket.off('userLeft');
+        newSocket.off('connect');
+        newSocket.off('disconnect');
+        newSocket.close();
       };
     }
-  }, [navigate, socket]);
+  }, [navigate, socket, handleIncomingMessage]);
 
-  const scrollToBottom = () => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  };
-
+  // Load initial messages when room changes
   useEffect(() => {
-    scrollToBottom();
-  }, [messages]);
+    if (currentRoom && !isReconnecting) {
+      fetchMessageHistory(currentRoom);
+    }
+  }, [currentRoom, fetchMessageHistory, isReconnecting]);
 
-  // Modified fetchMessageHistory to handle global chat and add error handling
-  const fetchMessageHistory = async (roomId) => {
+  const handleSendMessage = async (content) => {
+    if (!content.trim() || !socket || !currentRoom || isReconnecting) return;
+
+    setIsSendingMessage(true);
     try {
-      setIsLoadingHistory(true);
-      const token = localStorage.getItem('token');
-      
-      console.log('Fetching message history for room:', roomId);
-      
-      // Handle global chat differently
-      const endpoint = roomId === 'global' 
-        ? `${config.SERVER_URL}/api/messages/global`
-        : `${config.SERVER_URL}/api/messages/${roomId}`;
-
-      const response = await axios.get(
-        endpoint,
-        {
-          headers: { Authorization: `Bearer ${token}` }
-        }
+      const encryptedContent = await encryptMessage(
+        content,
+        config.SHARED_KEY
       );
-      
-      console.log('Received messages:', response.data);
-      
-      // Decrypt messages
-      const sharedKey = 'shared-secret-key';
-      const decryptedMessages = response.data.map(msg => {
-        try {
-          return {
-            ...msg,
-            content: decryptMessage(msg.content, sharedKey)
-          };
-        } catch (error) {
-          console.warn('Failed to decrypt message, using raw content:', error);
-          return msg;
+
+      socket.emit('sendMessage', {
+        content: encryptedContent,
+        sender: currentUsername,
+        roomId: currentRoom,
+        timestamp: new Date().toISOString(),
+        metadata: {
+          encrypted: true
         }
       });
-
-      console.log('Decrypted messages:', decryptedMessages);
-
-      setMessages(prev => ({
-        ...prev,
-        [roomId]: decryptedMessages
-      }));
     } catch (error) {
-      console.error('Error fetching message history:', error);
+      console.error('Error sending message:', error);
+      setError('Error sending message');
     } finally {
-      setIsLoadingHistory(false);
+      setIsSendingMessage(false);
     }
   };
 
-  // Modified handleJoinRoom to ensure proper room joining
-  const handleJoinRoom = async (roomId) => {
-    console.log('Joining room:', roomId);
-    setCurrentRoom(roomId);
-    
-    if (roomId === 'global') {
-      socket.emit('joinGlobalChat');
-    } else {
-      socket.emit('joinRoom', roomId);
-    }
-    
-    await fetchMessageHistory(roomId);
-    setDrawerOpen(false);
-  };
-
-  // Modified sendMessage to handle global chat
-  const sendMessage = (e) => {
-    e.preventDefault();
-    if (message.trim() && socket && currentRoom) {
-      try {
-        const sharedKey = 'shared-secret-key';
-        const encryptedContent = encryptMessage(message, sharedKey);
-        const timestamp = new Date().toISOString();
-        
-        const messageData = {
-          content: encryptedContent,
-          sender: localStorage.getItem('username'),
-          timestamp,
-          roomId: currentRoom === 'global' ? 'global' : currentRoom
-        };
-
-        socket.emit('sendMessage', messageData);
-        setMessage('');
-      } catch (error) {
-        console.error('Error sending message:', error);
-      }
-    }
-  };
-
-  // Add function to search users
-  const handleSearchUsers = async (query) => {
-    try {
-      const token = localStorage.getItem('token');
-      const response = await axios.get(`${config.SERVER_URL}/api/users/search?query=${query}`, {
-        headers: { Authorization: `Bearer ${token}` }
-      });
-      setSearchResults(response.data);
-    } catch (error) {
-      console.error('Error searching users:', error);
-      alert('Error searching users');
-    }
-  };
-
-  // Add function to add participant to room
-  const handleAddParticipant = async (userId) => {
+  // Room handlers
+  const handleCreateRoom = async (roomData) => {
     try {
       const token = localStorage.getItem('token');
       const response = await axios.post(
-        `${config.SERVER_URL}/api/rooms/${selectedRoom._id}/participants`,
-        { participants: [userId] },
-        { headers: { Authorization: `Bearer ${token}` }}
+        config.getApiUrl('rooms'),
+        roomData,
+        config.getRequestConfig(token)
       );
 
-      // Update the rooms list with the new participant
-      setRooms(prevRooms => 
-        prevRooms.map(room => 
-          room._id === selectedRoom._id ? response.data : room
-        )
-      );
-
-      setAddParticipantOpen(false);
-      setSearchUser('');
-      setSearchResults([]);
-      alert('Participant added successfully');
+      setRooms(prev => [...prev, response.data]);
+      setCurrentRoom(response.data.id);
+      socket?.emit('joinRoom', response.data.id);
     } catch (error) {
-      console.error('Error adding participant:', error);
-      alert(error.response?.data?.message || 'Error adding participant');
+      console.error('Error creating room:', error);
+      throw error;
     }
   };
 
-  const handleMenuClose = () => {
-    setSelectedRoom(null);
+  const handleJoinRoom = async (roomId) => {
+    try {
+      setCurrentRoom(roomId);
+      if (roomId === 'global') {
+        socket?.emit('joinGlobalChat');
+      } else {
+        socket?.emit('joinRoom', roomId);
+      }
+      setDrawerOpen(false);
+    } catch (error) {
+      console.error('Error joining room:', error);
+      setError('Error joining room');
+    }
+  };
+
+  const handleUpdateRoom = (updatedRoom) => {
+    setRooms(prev => 
+      prev.map(room => 
+        room.id === updatedRoom.id ? updatedRoom : room
+      )
+    );
   };
 
   const handleLogout = () => {
-    localStorage.removeItem('token');
-    localStorage.removeItem('username');
-    localStorage.removeItem('userId');
-    localStorage.removeItem('privateKey');
+    if (socket) {
+      socket.disconnect();
+    }
+    localStorage.clear();
     navigate('/login');
   };
 
-  const handleCreateRoom = async () => {
-    try {
-      const token = localStorage.getItem('token');
-      if (!token) {
-        alert('Please log in again.');
-        navigate('/login');
-        return;
-      }
-
-      console.log('Creating room:', newRoomName);
-      const response = await axios.post(
-        `${config.SERVER_URL}/api/rooms`,
-        { 
-          name: newRoomName,
-          participants: [] // Start with just the creator
-        },
-        { 
-          headers: { 
-            'Authorization': `Bearer ${token}`,
-            'Content-Type': 'application/json'
-          }
-        }
-      );
-
-      console.log('Room creation response:', response.data);
-
-      if (response.data) {
-        setRooms(prev => [...prev, response.data]);
-        setNewRoomName('');
-        setCreateRoomOpen(false);
-
-        // Join the newly created room
-        if (socket) {
-          console.log('Joining new room:', response.data._id);
-          socket.emit('joinRoom', response.data._id);
-          setCurrentRoom(response.data._id);
-          await fetchMessageHistory(response.data._id);
-        } else {
-          console.error('Socket not connected');
-          alert('Socket connection error. Please refresh the page.');
-        }
-      }
-    } catch (error) {
-      console.error('Error creating room:', {
-        error,
-        response: error.response,
-        data: error.response?.data,
-        status: error.response?.status
-      });
-      alert(error.response?.data?.message || 'Error creating room. Please try again.');
-    }
-  };
+  if (isConnecting) {
+    return (
+      <Backdrop open={true} sx={{ color: '#fff', zIndex: 9999 }}>
+        <Box sx={{ textAlign: 'center' }}>
+          <CircularProgress color="inherit" />
+          <Typography variant="h6" sx={{ mt: 2 }}>
+            Connecting to server...
+          </Typography>
+        </Box>
+      </Backdrop>
+    );
+  }
 
   return (
     <Box sx={{ height: '100vh', display: 'flex' }}>
-      <AppBar position="fixed">
-        <Toolbar>
-          <IconButton
-            edge="start"
-            color="inherit"
-            onClick={() => setDrawerOpen(true)}
-            sx={{ mr: 2 }}
-          >
-            <MenuIcon />
-          </IconButton>
-          <Typography variant="h6" component="div" sx={{ flexGrow: 1 }}>
-            Secure Chat
-          </Typography>
-          <IconButton
-            color="inherit"
-            onClick={handleLogout}
-            title="Logout"
-          >
-            <LogoutIcon />
-          </IconButton>
-        </Toolbar>
-      </AppBar>
-      <Container maxWidth="md" sx={{ mt: 8 }}>
-        <Paper elevation={3} sx={{ p: 2, height: '80vh', display: 'flex', flexDirection: 'column', mt: 2 }}>
-          <Box sx={{ display: 'flex', alignItems: 'center', mb: 2 }}>
-            <IconButton onClick={() => setDrawerOpen(true)} sx={{ mr: 1 }}>
-              <MenuIcon />
-            </IconButton>
-            <Typography variant="h4" sx={{ flexGrow: 1 }}>
-              {currentRoom === 'global' ? 'Global Chat' : rooms.find(r => r._id === currentRoom)?.name || 'Chat'}
-            </Typography>
-          </Box>
-          
-          <Box sx={{ flexGrow: 1, overflow: 'auto', mb: 2, p: 2 }}>
-            {(messages[currentRoom] || []).map((msg, index) => (
-              <Paper
-                key={index}
-                elevation={1}
-                sx={{
-                  p: 2,
-                  mb: 1,
-                  ml: msg.sender === localStorage.getItem('username') ? 'auto' : 0,
-                  mr: msg.sender === localStorage.getItem('username') ? 0 : 'auto',
-                  maxWidth: '70%',
-                  backgroundColor: msg.sender === localStorage.getItem('username') 
-                    ? 'primary.dark'
-                    : 'background.paper',
-                  wordBreak: 'break-word'
-                }}
-              >
-                <Typography variant="subtitle2" color="textSecondary">
-                  {msg.sender}
-                </Typography>
-                <Typography variant="body1">{msg.content}</Typography>
-                <Typography variant="caption" color="textSecondary">
-                  {new Date(msg.timestamp).toLocaleTimeString()}
-                </Typography>
-              </Paper>
-            ))}
-            <div ref={messagesEndRef} />
-          </Box>
-
-          <Box component="form" onSubmit={sendMessage} sx={{ display: 'flex', gap: 1 }}>
-            <TextField
-              fullWidth
-              value={message}
-              onChange={(e) => setMessage(e.target.value)}
-              placeholder="Type a message..."
-              variant="outlined"
-              size="small"
-              autoComplete="off"
-            />
-            <Button 
-              type="submit" 
-              variant="contained" 
-              color="primary"
-              disabled={!message.trim()}
-            >
-              Send
-            </Button>
-          </Box>
-        </Paper>
-
-        {/* Room Drawer */}
-        <Drawer
-          anchor="left"
-          open={drawerOpen}
-          onClose={() => setDrawerOpen(false)}
-        >
-          <Box sx={{ width: 250, p: 2 }}>
-            <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
-              <Typography variant="h6">Rooms</Typography>
-              <IconButton onClick={() => setCreateRoomOpen(true)}>
-                <AddIcon />
-              </IconButton>
-            </Box>
-            <Divider />
-            <List>
-              <ListItem
-                button
-                selected={currentRoom === 'global'}
-                onClick={() => {
-                  setCurrentRoom('global');
-                  setDrawerOpen(false);
-                }}
-              >
-                <ListItemText primary="Global Chat" />
-              </ListItem>
-              {rooms.map((room) => (
-                <ListItem
-                  key={room._id}
-                  button
-                  selected={currentRoom === room._id}
-                  onClick={() => handleJoinRoom(room._id)}
-                  sx={{
-                    display: 'flex',
-                    justifyContent: 'space-between',
-                    alignItems: 'center'
-                  }}
-                >
-                  <ListItemText 
-                    primary={room.name}
-                    secondary={`${room.participants.length} participants`}
-                  />
-                  {room.creator._id === currentUserId && (
-                    <IconButton
-                      edge="end"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        setSelectedRoom(room);
-                        setAddParticipantOpen(true);
-                      }}
-                    >
-                      <MoreVertIcon />
-                    </IconButton>
-                  )}
-                </ListItem>
-              ))}
-            </List>
-          </Box>
-        </Drawer>
-
-        {/* Add Participant Dialog */}
-        <Dialog 
-          open={addParticipantOpen} 
-          onClose={() => {
-            setAddParticipantOpen(false);
-            setSearchUser('');
-            setSearchResults([]);
+      {isReconnecting && (
+        <Box
+          sx={{
+            position: 'fixed',
+            top: 0,
+            left: 0,
+            right: 0,
+            zIndex: 9999,
+            bgcolor: 'error.main',
+            color: 'error.contrastText',
+            p: 1,
+            textAlign: 'center',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            gap: 1
           }}
         >
-          <DialogTitle>Add Participant</DialogTitle>
-          <DialogContent>
-            <TextField
-              autoFocus
-              margin="dense"
-              label="Search Users"
-              fullWidth
-              value={searchUser}
-              onChange={(e) => {
-                setSearchUser(e.target.value);
-                if (e.target.value.trim()) {
-                  handleSearchUsers(e.target.value);
-                } else {
-                  setSearchResults([]);
-                }
-              }}
-            />
-            <List>
-              {searchResults.map((user) => (
-                <ListItem key={user._id} button onClick={() => handleAddParticipant(user._id)}>
-                  <ListItemText 
-                    primary={user.username}
-                    secondary={user.email}
-                  />
-                </ListItem>
-              ))}
-            </List>
-          </DialogContent>
-          <DialogActions>
-            <Button onClick={() => {
-              setAddParticipantOpen(false);
-              setSearchUser('');
-              setSearchResults([]);
-            }}>
-              Cancel
-            </Button>
-          </DialogActions>
-        </Dialog>
+          <WifiOffIcon />
+          <Typography>
+            Connection lost. Attempting to reconnect...
+            {connectionAttempts > 0 && ` (Attempt ${connectionAttempts})`}
+          </Typography>
+        </Box>
+      )}
 
-        {/* Create Room Dialog */}
-        <Dialog open={createRoomOpen} onClose={() => setCreateRoomOpen(false)}>
-          <DialogTitle>Create New Room</DialogTitle>
-          <DialogContent>
-            <TextField
-              autoFocus
-              margin="dense"
-              label="Room Name"
-              fullWidth
-              value={newRoomName}
-              onChange={(e) => setNewRoomName(e.target.value)}
-            />
-          </DialogContent>
-          <DialogActions>
-            <Button onClick={() => setCreateRoomOpen(false)}>Cancel</Button>
-            <Button onClick={handleCreateRoom} disabled={!newRoomName.trim()}>
-              Create
-            </Button>
-          </DialogActions>
-        </Dialog>
+      <AppBar 
+        position="fixed"
+        sx={{
+          top: isReconnecting ? '40px' : 0,
+          transition: 'top 0.3s'
+        }}
+      >
+        <Toolbar>
+          <Box sx={{ display: 'flex', alignItems: 'center', width: '100%' }}>
+            <IconButton
+              edge="start"
+              color="inherit"
+              onClick={() => setDrawerOpen(true)}
+              sx={{ mr: 2 }}
+            >
+              <MenuIcon />
+            </IconButton>
+            <Typography variant="h6" sx={{ flexGrow: 1 }}>
+              {currentRoom === 'global' ? 'Global Chat' : 
+                rooms.find(r => r.id === currentRoom)?.name || 'Chat'}
+            </Typography>
+            <IconButton
+              color="inherit"
+              onClick={handleLogout}
+              title="Logout"
+            >
+              <LogoutIcon />
+            </IconButton>
+          </Box>
+        </Toolbar>
+      </AppBar>
+
+      <Drawer
+        anchor="left"
+        open={drawerOpen}
+        onClose={() => setDrawerOpen(false)}
+      >
+        <RoomList
+          rooms={rooms}
+          currentRoom={currentRoom}
+          currentUserId={currentUserId}
+          onJoinRoom={handleJoinRoom}
+          onCreateRoom={() => setCreateRoomOpen(true)}
+          onManageRoom={(room) => {
+            setSelectedRoom(room);
+            setManageRoomOpen(true);
+          }}
+        />
+      </Drawer>
+
+      <Container 
+        maxWidth="md" 
+        sx={{ 
+          mt: isReconnecting ? 12 : 8,
+          mb: 2,
+          transition: 'margin-top 0.3s'
+        }}
+      >
+        <Paper 
+          elevation={3} 
+          sx={{ 
+            height: 'calc(100vh - 100px)',
+            display: 'flex',
+            flexDirection: 'column',
+            opacity: isReconnecting ? 0.7 : 1,
+            transition: 'opacity 0.3s'
+          }}
+        >
+          <MessageList
+            messages={messages[currentRoom] || []}
+            currentUsername={currentUsername}
+            isLoading={isLoadingMessages}
+            error={error}
+          />
+
+          <MessageInput
+            onSendMessage={handleSendMessage}
+            isLoading={isSendingMessage}
+            disabled={!currentRoom || isReconnecting}
+            placeholder={isReconnecting ? 'Reconnecting...' : undefined}
+          />
+        </Paper>
       </Container>
+
+      <CreateRoomDialog
+        open={createRoomOpen}
+        onClose={() => setCreateRoomOpen(false)}
+        onCreateRoom={handleCreateRoom}
+      />
+
+      {selectedRoom && (
+        <ManageRoomDialog
+          open={manageRoomOpen}
+          room={selectedRoom}
+          currentUserId={currentUserId}
+          onClose={() => {
+            setManageRoomOpen(false);
+            setSelectedRoom(null);
+          }}
+          onUpdateRoom={handleUpdateRoom}
+        />
+      )}
+
+      <Snackbar
+        open={!!error}
+        autoHideDuration={6000}
+        onClose={() => setError('')}
+        anchorOrigin={{ vertical: 'bottom', horizontal: 'center' }}
+      >
+        <Alert 
+          severity="error" 
+          onClose={() => setError('')}
+          variant="filled"
+        >
+          {error}
+        </Alert>
+      </Snackbar>
     </Box>
   );
 };
